@@ -137,7 +137,9 @@ function M:entry(job)
 	scrolled_columns = math.max(0, scrolled_columns + scroll_delta)
 	set_opts("scrolled_columns", scrolled_columns)
 
-	ya.emit("seek", { "lateral scroll" })
+	-- Force a re-peek so the newly scrolled columns repaint. On yazi 26.x the old
+	-- `ya.emit("seek", ...)` no longer triggers a preview refresh here.
+	ya.emit("peek", { force = true })
 end
 
 -- Setup from init.lua: require("duckdb"):setup({ mode = "standard"/"summarized" })
@@ -423,7 +425,7 @@ set variable included_columns = (
 	)
 
 	local filtered_select = string.format(
-		"select %scolumns(c -> list_contains(getvariable('included_columns'), c)) from %s limit %d offset %d;",
+		"select %scolumns(lambda c: list_contains(getvariable('included_columns'), c)) from %s limit %d offset %d;",
 		row_id_prefix,
 		target,
 		limit,
@@ -672,8 +674,12 @@ local function create_cache(job, mode, file_type, limit)
 	local base_query = generate_preload_query(job, mode, file_type, limit)
 	local query = string.format("COPY (%s) TO '%s' (FORMAT 'parquet');", base_query, target)
 	local output = run_query(job, query, nil, file_type)
-	ya.dbg("stdout: " .. tostring(output.stdout))
-	ya.dbg("stderr: " .. tostring(output.stderr))
+	-- run_query returns nil if duckdb fails to spawn or exits non-zero; guard the
+	-- debug logging so we don't index a nil value before the check below.
+	if output then
+		ya.dbg("stdout: " .. tostring(output.stdout))
+		ya.dbg("stderr: " .. tostring(output.stderr))
+	end
 
 	if not output or (output.stderr and output.stderr ~= "") then
 		ya.err(
@@ -758,8 +764,13 @@ function M:peek(job)
 	local query = generate_peek_query(args.target, job, args.limit, args.offset, args.file_type, args.cache_str)
 	ya.dbg("query: " .. tostring(query))
 	local output = run_query(job, query, args.target, args.file_type)
-	ya.dbg("stdout: " .. tostring(output.stdout))
-	ya.dbg("stderr: " .. tostring(output.stderr))
+	-- run_query returns nil if duckdb fails to spawn or exits non-zero; guard the
+	-- debug logging so we don't index a nil value before output_is_valid() (which
+	-- already handles nil) runs.
+	if output then
+		ya.dbg("stdout: " .. tostring(output.stdout))
+		ya.dbg("stderr: " .. tostring(output.stderr))
+	end
 	if not output_is_valid(output, args.mode, job) then
 		if args.target == args.cache_url and args.scrolled_collumns == 0 then
 			add_to_list("bad_cache", args.cache_str)
@@ -772,8 +783,17 @@ function M:peek(job)
 
 	if args.target == args.file_url and args.mode == "summarized" and not args.use_cache then
 		render_output(output, job)
-		while not is_on_list("completed", args.cache_str) do
+		-- Wait for the preloader to finish building the fast cache, then re-peek to
+		-- show it. Bounded (~5s) so a "completed" signal that never arrives (e.g. the
+		-- preloader failed) can't spin this peek task forever on yazi 26.x.
+		local waited = 0
+		while not is_on_list("completed", args.cache_str) and waited < 25 do
 			ya.sleep(0.2)
+			waited = waited + 1
+		end
+		if not is_on_list("completed", args.cache_str) then
+			-- Cache never completed; keep the direct-from-file render we already drew.
+			return
 		end
 		clear_list("completed")
 		set_opts("re_peek", true)
